@@ -1,0 +1,7 @@
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+color_matching_dump.sql
+.env
+.git
+web-src/node_modules
