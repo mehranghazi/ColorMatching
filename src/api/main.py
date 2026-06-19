@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routers import matching
+from .routers import matching, auth
+from .init_db import init_database
 import logging
 import os
 
@@ -21,6 +22,7 @@ app.add_middleware(
 )
 
 app.include_router(matching.router)
+app.include_router(auth.router)
 
 @app.get("/health")
 def health():
@@ -29,5 +31,6 @@ def health():
 @app.on_event("startup")
 async def startup():
     logger.info("Color Matching API starting up...")
+    init_database()
 
 # serve web app — must be last

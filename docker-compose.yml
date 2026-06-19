@@ -22,6 +22,7 @@ services:
     container_name: color_matching_api
     environment:
       DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/color_matching
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-color-matching-dev-secret-change-in-production}
     ports:
       - "8000:8000"
     depends_on:

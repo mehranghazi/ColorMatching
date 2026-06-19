@@ -1,29 +1,18 @@
-# Dependencies
-node_modules/
+# database dump - too large for git, distribute separately
+color_matching_dump.sql
+*.sql
+
+# but keep schema.sql since it's small and useful
+!schema.sql
+
+# python
 __pycache__/
 *.pyc
-*.egg-info/
-
-# Environment
 .env
-.env.local
-.env.*.local
 
-# Database dumps with data
-color_matching_dump.sql
+# node
+node_modules/
+web-src/build/
 
-# Logs
-*.log
-logs/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# os
 .DS_Store
-
-# Build output
-dist/
-build/

@@ -10,6 +10,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 from ..database import get_db
+from ..auth import get_current_user
 from ..core.algorithms import (
     nearest_neighbor, delaunay_interpolation, allen_match
 )
@@ -63,8 +64,70 @@ def load_lut(db: Session, combo_type: int, force_combo_id: int | None = None):
     query += " ORDER BY l.combination_id"
     return db.execute(text(query), params).fetchall()
 
+
+def log_matching_session(
+    db: Session,
+    user_id: int,
+    input_type: str,
+    method: str,
+    combo_type: int,
+    combo_id: int,
+    lab_query: np.ndarray,
+    delta_e: float,
+    inside_gamut: bool,
+    response_data: dict,
+    input_r=None,
+    input_g=None,
+    input_b=None,
+    input_x=None,
+    input_y=None,
+    input_z=None,
+):
+    try:
+        db.execute(
+            text("""
+                INSERT INTO matching_session
+                    (user_id, input_type, method_used, combo_type, combination_id,
+                     input_r, input_g, input_b, input_x, input_y, input_z,
+                     query_l, query_a, query_b,
+                     delta_e_real, inside_gamut, result_json)
+                VALUES
+                    (:user_id, :input_type, :method, :combo_type, :combo_id,
+                     :inp_r, :inp_g, :inp_b, :inp_x, :inp_y, :inp_z,
+                     :lab_l, :lab_a, :lab_b,
+                     :de, :gamut, :result)
+            """),
+            {
+                "user_id": user_id,
+                "input_type": input_type,
+                "method": method,
+                "combo_type": combo_type,
+                "combo_id": combo_id,
+                "inp_r": input_r,
+                "inp_g": input_g,
+                "inp_b": input_b,
+                "inp_x": input_x,
+                "inp_y": input_y,
+                "inp_z": input_z,
+                "lab_l": float(lab_query[0]),
+                "lab_a": float(lab_query[1]),
+                "lab_b": float(lab_query[2]),
+                "de": delta_e,
+                "gamut": inside_gamut,
+                "result": json.dumps(response_data),
+            },
+        )
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log session: {e}")
+
+
 @router.post("/rgb")
-def match_from_rgb(body: RGBInput, db: Session = Depends(get_db)):
+def match_from_rgb(
+    body: RGBInput,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     # 1. convert sRGB → XYZ → Lab
     sRGB = np.array([body.R, body.G, body.B])
     XYZ_query = srgb_to_xyz(sRGB)
@@ -99,41 +162,30 @@ def match_from_rgb(body: RGBInput, db: Session = Depends(get_db)):
         "query_ab":         query_ab,
         **best
     }
-    # 4. log to history
-    try:
-        db.execute(text("""
-            INSERT INTO matching_session
-                (method_used, combo_type, combination_id,
-                 input_R, input_G, input_B,
-                 query_L, query_a, query_b,
-                 delta_e_real, inside_gamut, result_json)
-            VALUES
-                (:method, :combo_type, :combo_id,
-                 :R, :G, :B,
-                 :L, :a, :b,
-                 :de, :gamut, :result)
-        """), {
-            "method":     best["method_used"],
-            "combo_type": body.combo_type,
-            "combo_id":   best["combination_id"],
-            "R":          float(body.R),
-            "G":          float(body.G),
-            "B":          float(body.B),
-            "L":          float(Lab_query[0]),
-            "a":          float(Lab_query[1]),
-            "b":          float(Lab_query[2]),
-            "de":         best["delta_e_real"],
-            "gamut":      best["inside_gamut"],
-            "result":     json.dumps(response_data)
-        })
-        db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to log session: {e}")
+    log_matching_session(
+        db,
+        current_user["id"],
+        "rgb",
+        best["method_used"],
+        body.combo_type,
+        best["combination_id"],
+        Lab_query,
+        best["delta_e_real"],
+        best["inside_gamut"],
+        response_data,
+        input_r=float(body.R),
+        input_g=float(body.G),
+        input_b=float(body.B),
+    )
 
     return response_data
 
 @router.post("/xyz")
-def match_from_xyz(body: XYZInput, db: Session = Depends(get_db)):
+def match_from_xyz(
+    body: XYZInput,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     # 1. XYZ → Lab
     D65, OBS = load_illuminant(db)
     XYZ_query = np.array([body.X, body.Y, body.Z])
@@ -186,7 +238,7 @@ def match_from_xyz(body: XYZInput, db: Session = Depends(get_db)):
         )
         real_delta_e = float(np.sqrt(np.sum((Lab_query - Lab_produced) ** 2)))
 
-        return {
+        response_data = {
             "input":            {"X": body.X, "Y": body.Y, "Z": body.Z},
             "query_Lab":        Lab_query.tolist(),
             "combination_id":   body.force_combo_id,
@@ -195,7 +247,6 @@ def match_from_xyz(body: XYZInput, db: Session = Depends(get_db)):
             "produced_Lab":     Lab_produced.tolist(),
             "query_xy":         query_xy,
             "query_ab":         query_ab,
-            
             "dyes": [
                 {
                     "name":          d.trade_name,
@@ -207,6 +258,22 @@ def match_from_xyz(body: XYZInput, db: Session = Depends(get_db)):
             "delta_e_lut":  result.get("distance", 0.0),
             "delta_e_real": real_delta_e
         }
+        log_matching_session(
+            db,
+            current_user["id"],
+            "xyz",
+            result["method"],
+            body.combo_type,
+            body.force_combo_id,
+            Lab_query,
+            real_delta_e,
+            result["method"] == "delaunay",
+            response_data,
+            input_x=body.X,
+            input_y=body.Y,
+            input_z=body.Z,
+        )
+        return response_data
 
     else:
         # try all combinations, pick best
@@ -216,13 +283,29 @@ def match_from_xyz(body: XYZInput, db: Session = Depends(get_db)):
         if not best:
             raise HTTPException(404, "No matching combination found")
 
-        return {
+        response_data = {
             "input":     {"X": body.X, "Y": body.Y, "Z": body.Z},
             "query_Lab": Lab_query.tolist(),
             "query_xy":  query_xy,
             "query_ab":  query_ab,
             **best
         }
+        log_matching_session(
+            db,
+            current_user["id"],
+            "xyz",
+            best["method_used"],
+            body.combo_type,
+            best["combination_id"],
+            Lab_query,
+            best["delta_e_real"],
+            best["inside_gamut"],
+            response_data,
+            input_x=body.X,
+            input_y=body.Y,
+            input_z=body.Z,
+        )
+        return response_data
 
 
 @router.get("/ks-data")
@@ -561,33 +644,56 @@ async def extract_rgb(file: UploadFile = File(...)):
 
 
 @router.get("/history")
-def get_history(limit: int = 20, db: Session = Depends(get_db)):
+def get_history(
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    logger.info(
+        "Fetching history for user %s (limit=%s)",
+        current_user["id"],
+        limit,
+    )
     rows = db.execute(text("""
         SELECT
             ms.id,
             ms.created_at,
             ms.method_used,
             ms.combo_type,
+            ms.input_type,
             dc.name as combination_name,
-            ms.input_R, ms.input_G, ms.input_B,
-            ms.query_L, ms.query_a, ms.query_b,
+            ms.input_r AS inp_r,
+            ms.input_g AS inp_g,
+            ms.input_b AS inp_b,
+            ms.input_x AS inp_x,
+            ms.input_y AS inp_y,
+            ms.input_z AS inp_z,
+            ms.query_l AS lab_l,
+            ms.query_a AS lab_a,
+            ms.query_b AS lab_b,
             ms.delta_e_real,
             ms.inside_gamut,
             ms.result_json
         FROM matching_session ms
         LEFT JOIN dye_combination dc ON dc.id = ms.combination_id
+        WHERE ms.user_id = :user_id
         ORDER BY ms.created_at DESC
         LIMIT :limit
-    """), {"limit": limit}).fetchall()
+    """), {"user_id": current_user["id"], "limit": limit}).fetchall()
 
     return [
         {
             "id":               r.id,
             "created_at":       r.created_at.isoformat(),
             "method":           r.method_used,
+            "combo_type":       r.combo_type,
+            "input_type":       r.input_type,
             "combination":      r.combination_name,
-            "rgb":              {"R": r.input_r, "G": r.input_g, "B": r.input_b},
-            "Lab":              [r.query_l, r.query_a, r.query_b],
+            "rgb":              {"R": r.inp_r, "G": r.inp_g, "B": r.inp_b}
+                                if r.inp_r is not None else None,
+            "xyz":              {"X": r.inp_x, "Y": r.inp_y, "Z": r.inp_z}
+                                if r.inp_x is not None else None,
+            "Lab":              [r.lab_l, r.lab_a, r.lab_b],
             "delta_e":          r.delta_e_real,
             "inside_gamut":     r.inside_gamut,
             "result":           r.result_json,
@@ -645,7 +751,11 @@ class SpectralInput(BaseModel):
 
 
 @router.post("/spectral")
-def match_from_spectral(body: SpectralInput, db: Session = Depends(get_db)):
+def match_from_spectral(
+    body: SpectralInput,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     if len(body.reflectance) != 31:
         raise HTTPException(400, "reflectance must contain exactly 31 values (400-700nm, 10nm steps)")
 
@@ -675,7 +785,7 @@ def match_from_spectral(body: SpectralInput, db: Session = Depends(get_db)):
     if not best:
         raise HTTPException(404, "No matching combination found")
 
-    return {
+    response_data = {
         "input":     {"reflectance": body.reflectance},
         "query_Lab": Lab_query.tolist(),
         "query_xy":  query_xy,
@@ -683,3 +793,19 @@ def match_from_spectral(body: SpectralInput, db: Session = Depends(get_db)):
         "XYZ":       XYZ_query.tolist(),
         **best
     }
+    log_matching_session(
+        db,
+        current_user["id"],
+        "spectral",
+        best["method_used"],
+        body.combo_type,
+        best["combination_id"],
+        Lab_query,
+        best["delta_e_real"],
+        best["inside_gamut"],
+        response_data,
+        input_x=float(XYZ_query[0]),
+        input_y=float(XYZ_query[1]),
+        input_z=float(XYZ_query[2]),
+    )
+    return response_data
